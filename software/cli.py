@@ -42,12 +42,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # at a 1 GB stride, the last one 96 KB short (the bank-group skew); the YPCB-00338 splits each
 # 2 GB DDR3 controller above the weight base evenly between its windows (trixium_ypcb.py: 864 MB
 # at 4 channels, 432 MB at 8), the last one short of its bank skew (64 KB / windows each).
-BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb"}
+BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb", "vc707": "-vc707"}
 
 # Engine channels of each board's bitstream (convert's default --channels), and the boards whose
 # bitstream unpacks 5-trit codes (convert's default --trit5).
-BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 8}
-BOARD_TRIT5    = {"fk33": False, "xcu1525": False, "ypcb": True}
+BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 8, "vc707": 2}
+BOARD_TRIT5    = {"fk33": False, "xcu1525": False, "ypcb": True, "vc707": True}
 
 
 def board_windows(board, channels):
@@ -59,6 +59,11 @@ def board_windows(board, channels):
         chan_mod = channels//2
         stride   = ddr_chan_stride(2 << 30, chan_mod)
         return stride, stride, (chan_mod - 1)*(0x10000//chan_mod)
+    if board == "vc707":
+        # One 1 GB controller split between the channels (trixium_vc707.py).
+        from model.layout import ddr_chan_stride
+        stride = ddr_chan_stride(1 << 30, channels)
+        return stride, stride, (channels - 1)*(0x10000//channels)
     return None, None, 0
 
 

@@ -79,6 +79,8 @@ REQUIRED_CLOCKS = {
     # target adds its sys clock (gate(clocks=)). Reference build (strict PASS, 2026-10-11, sys
     # 125 MHz): WNS +0.001 ns, WHS +0.017 ns, 359,171 endpoints; sys 150 MHz: WNS -1.33 ns.
     "ypcb" : (20.0, 7.5, 1.875, 5.0),
+    # clk200 / IDELAY 200, ddr 100 MHz and the V7DDRPHY's 4x (DDR3-800); sys from gate(clocks=).
+    "vc707": (5.0, 10.0, 2.5),
 }
 
 # Report Parsing -----------------------------------------------------------------------------------

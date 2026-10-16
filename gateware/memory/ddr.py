@@ -301,18 +301,25 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
         wb_sdram = wishbone.Interface(data_width=soc.bus.data_width, address_width=32,
                                       addressing="word")
         soc.bus.add_slave(name="main_ram", slave=wb_sdram)
-        l2_size = 2**int(math.log2(max(l2_size, int(2*port.data_width/8))))
-        # reverse=False: word i of a line at bits [32*i +: 32], as the AXI paths (the CPU's
-        # memory bus, the engine) and LiteX's add_sdram have it; the default reversed the words
-        # of every line between the bus (PCIe/JTAG) and the DRAM.
-        l2 = wishbone.Cache(cachesize=l2_size//4, master=wb_sdram,
-            slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32,
-                                     addressing="word"),
-            reverse=False)
-        soc.l2_cache = FullMemoryWE()(l2)
-        soc.add_config("L2_SIZE", l2_size)
-        soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,
-                                                      base_address=base)
+        if l2_size == 0:
+            # No L2: the bus masters' (SD DMA) writes reach the DRAM directly. The CPU reads
+            # main_ram on its own memory bus, past any L2, which would hide the last dirty
+            # lines of a DMA from it (VC707's SD boot and sdload).
+            soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=wb_sdram, port=port,
+                                                          base_address=base)
+        else:
+            l2_size = 2**int(math.log2(max(l2_size, int(2*port.data_width/8))))
+            # reverse=False: word i of a line at bits [32*i +: 32], as the AXI paths (the CPU's
+            # memory bus, the engine) and LiteX's add_sdram have it; the default reversed the words
+            # of every line between the bus (PCIe/JTAG) and the DRAM.
+            l2 = wishbone.Cache(cachesize=l2_size//4, master=wb_sdram,
+                slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32,
+                                         addressing="word"),
+                reverse=False)
+            soc.l2_cache = FullMemoryWE()(l2)
+            soc.add_config("L2_SIZE", l2_size)
+            soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,
+                                                          base_address=base)
 
     # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1 (with the BIST: 4k,
     # 4k + 1, then its generator and checker).

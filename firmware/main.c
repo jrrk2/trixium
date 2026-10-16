@@ -36,6 +36,9 @@
 #include "vec.h"
 #include "progs.h"
 #include "static_memory.h"
+#include "sdload.h"
+
+#define SDLOAD_DEFAULT "TRIXIUM.IMG" // The image sdload and the boot take from the SD card.
 
 /* Checks */
 /*--------*/
@@ -44,9 +47,11 @@
 // ddr.c reaches controller k's registers as controller 0's shifted by k*STRIDE: the target
 // pins the (sdram, ddrphy) CSR pairs to consecutive pages, and this is where that is checked.
 // (The PHY model of the Verilator sim has no CSRs, hence the ddrphy guards.)
+#if TRIXIUM_N_MEMCTRL > 1
 _Static_assert(CSR_SDRAM1_BASE - CSR_SDRAM_BASE == TRIXIUM_DDR_CSR_STRIDE, "sdram1 CSR page");
 #ifdef CSR_DDRPHY_BASE
 _Static_assert(CSR_DDRPHY1_BASE - CSR_DDRPHY_BASE == TRIXIUM_DDR_CSR_STRIDE, "ddrphy1 CSR page");
+#endif
 #endif
 #if TRIXIUM_N_MEMCTRL > 2
 _Static_assert(CSR_SDRAM2_BASE - CSR_SDRAM_BASE == 2*TRIXIUM_DDR_CSR_STRIDE, "sdram2 CSR page");
@@ -152,6 +157,7 @@ static void help(void)
     puts("Inference:");
     puts("  info              - model info (BONS header)");
     puts("  hdrload           - copy the BONS header+table staged by trixium_load to CPU memory");
+    puts("  sdload [file]     - load a BONS image from the SD card (default " SDLOAD_DEFAULT ")");
     puts("  tokclr/tok/genb   - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("  gen n id id ...   - generate n tokens from prompt ids");
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
@@ -811,6 +817,10 @@ static void console_service(void)
                engine_diag ? "on" : "off");
     } else if (strcmp(token, "hdrload") == 0)
         hdrload();
+    else if (strcmp(token, "sdload") == 0) {
+        if (sdload(strlen(str) ? str : SDLOAD_DEFAULT) == 0)
+            hdrload();
+    }
     else if (strlen(token))
         puts("unknown command");
     printf("trixium> ");
@@ -861,7 +871,14 @@ int main(void)
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
 #endif
+#ifdef TRIXIUM_SDLOAD
+    // No host link to upload with: an image already in the channels (a CPU reset) is kept,
+    // otherwise the SD card's.
+    if (hdrload_staged(1) < 0 && sdload(SDLOAD_DEFAULT) == 0)
+        hdrload_staged(0);
+#else
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
+#endif
     model_info();
     sptest();
     { // Vec unit smoke test: quant8 of a known ramp via the CSR dispatch path. Catches
