@@ -36,6 +36,8 @@ from litex.gen import *
 
 from litex_boards.platforms import xilinx_vc707
 
+from litex.build.generic_platform import Subsignal, Pins, IOStandard, Misc
+
 from litex.soc.cores.clock import *
 from litex.soc.cores.led import LedChaser
 from litex.soc.integration.soc import *
@@ -65,6 +67,48 @@ def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1)
         read_time          = read_time,
         write_time         = write_time,
         refresh_postponing = refresh_postponing)
+
+# DDR3 pads ---------------------------------------------------------------------------------------
+
+# The SODIMM's full 64 data bits: litex-boards' `ddram` declares the low 32 only (512 MB, half the
+# bandwidth; LiteDRAM sizes the memory from the module geometry AND the PHY width). From the
+# xc7-bitstream-tools VC707 target (--with-ddr64), checked against the VC707 pinout.
+_ddram64_io = [
+    ("ddram64", 0,
+        Subsignal("a", Pins(
+            "A20 B19 C20 A19 A17 A16 D20 C18",
+            "D17 C19 B21 B17 A15 A21 F17 E17"),
+            IOStandard("SSTL15")),
+        Subsignal("ba",      Pins("D21 C21 D18"), IOStandard("SSTL15")),
+        Subsignal("ras_n",   Pins("E20"), IOStandard("SSTL15")),
+        Subsignal("cas_n",   Pins("K17"), IOStandard("SSTL15")),
+        Subsignal("we_n",    Pins("F20"), IOStandard("SSTL15")),
+        Subsignal("cs_n",    Pins("J17"), IOStandard("SSTL15")),
+        Subsignal("dm",      Pins("M13 K15 F12 A14 C23 D25 C31 F31"),
+            IOStandard("SSTL15")),
+        Subsignal("dq",      Pins(
+            "N14 N13 L14 M14 M12 N15 M11 L12",
+            "K14 K13 H13 J13 L16 L15 H14 J15",
+            "E15 E13 F15 E14 G13 G12 F14 G14",
+            "B14 C13 B16 D15 D13 E12 C16 D16",
+            "A24 B23 B27 B26 A22 B22 A25 C24",
+            "E24 D23 D26 C25 E23 D22 F22 E22",
+            "A30 D27 A29 C28 D28 B31 A31 A32",
+            "E30 F29 F30 F27 C30 E29 F26 D30"),
+            IOStandard("SSTL15_T_DCI")),
+        Subsignal("dqs_p",   Pins("N16 K12 H16 C15 A26 F25 B28 E27"),
+            IOStandard("DIFF_SSTL15")),
+        Subsignal("dqs_n",   Pins("M16 J12 G16 C14 A27 E25 B29 E28"),
+            IOStandard("DIFF_SSTL15")),
+        Subsignal("clk_p",   Pins("H19"), IOStandard("DIFF_SSTL15")),
+        Subsignal("clk_n",   Pins("G18"), IOStandard("DIFF_SSTL15")),
+        Subsignal("cke",     Pins("K19"), IOStandard("SSTL15")),
+        Subsignal("odt",     Pins("H20"), IOStandard("SSTL15")),
+        Subsignal("reset_n", Pins("C29"), IOStandard("LVCMOS15")),
+        Misc("SLEW=FAST"),
+        Misc("VCCAUX_IO=HIGH"),
+    ),
+]
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -130,11 +174,15 @@ class TriXiumVC707SoC(SoCCore):
         # DDR3 -------------------------------------------------------------------------------------
         # One controller: the CPU's main_ram (256 MB, through the L2 cache) and the engine ports.
         self.sdrams = []
-        phy = V7DDRPHY(platform.request("ddram"),
+        platform.add_extension(_ddram64_io)
+        phy = V7DDRPHY(platform.request("ddram64"),
             memtype      = "DDR3",
             sys_clk_freq = ddr_clk_freq,
             name         = "ddrphy")
-        phy.add_constraints(platform) if hasattr(phy, "add_constraints") else None
+        # SSTL15_T_DCI DQ: the startup must not wait for DCI match, or a JTAG-loaded bitstream
+        # stays in startup with DONE low on this board.
+        platform.add_platform_command(
+            "set_property BITSTREAM.STARTUP.MATCH_CYCLE NoWait [current_design]")
         add_ddr_domain_controllers(self, [phy], [MT8JTF12864(ddr_clk_freq, "1:4")], ddr_clk_freq,
             main_ram_size, kwargs.get("l2_size", 0), DDR_CSR_WINDOW,
             phy_renames={"sys": "ddr", "sys4x": "ddr4x"},
