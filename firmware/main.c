@@ -37,8 +37,12 @@
 #include "progs.h"
 #include "static_memory.h"
 #include "sdload.h"
+#include "nfsload.h"
+#include "tokenizer.h"
 
-#define SDLOAD_DEFAULT "TRIXIUM.IMG" // The image sdload and the boot take from the SD card.
+#define SDLOAD_DEFAULT  "TRIXIUM.IMG"         // The image sdload takes from the SD card.
+#define NFSLOAD_DEFAULT "trixium/TRIXIUM.IMG" // The image nfsload and the boot take from the NFS export.
+#define TOKLOAD_DEFAULT "trixium/TRIXIUM.TOK" // The tokenizer table (model/tokbin.py), next to it.
 
 /* Checks */
 /*--------*/
@@ -158,6 +162,12 @@ static void help(void)
     puts("  info              - model info (BONS header)");
     puts("  hdrload           - copy the BONS header+table staged by trixium_load to CPU memory");
     puts("  sdload [file]     - load a BONS image from the SD card (default " SDLOAD_DEFAULT ")");
+    puts("  nfsload [path]    - load a BONS image from the NFS export (default " NFSLOAD_DEFAULT ")");
+    puts("  tokload [path]    - load the tokenizer table from the NFS export (default " TOKLOAD_DEFAULT ")");
+    puts("  tokenize <text>   - the card's token ids for <text>");
+    puts("  detok <ids...>    - the text of token ids");
+    puts("  chat [max]        - chat in text: tokenized on the card, replies streamed token by token");
+    puts("  ethstat           - MAC receive counters (full slots, preamble/FCS errors, S&F drops)");
     puts("  tokclr/tok/genb   - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("  gen n id id ...   - generate n tokens from prompt ids");
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
@@ -182,6 +192,7 @@ static void help(void)
     puts("  ddrinit [k]       - re-init DDR controller k (default: 1..N-1)");
     puts("  ddrtest [c]       - engine store/fetch round trip through channel c's window (all)");
 #endif
+    puts("  fetchtest [tag]   - FETCH sweep (channel x length x half-word offset), reports wedges");
     puts("  engreset          - soft reset of the engine cluster (automatic after a stall)");
     puts("  wedge             - stall the engine on purpose, recover, rerun the self-test");
     puts("  help              - this message");
@@ -387,6 +398,49 @@ static void hdrload(void)
 // truth for "did the host's upload land where the engine looks for it?" - the two sides
 // agree on paper (both byte addresses, both indexing hbm.axi[1+c]) but only this says so.
 //   peek <chan> <hex-addr>
+// Engine read-path sweep: FETCH every (channel, length, half-word offset) from the weight
+// region and report the cases that wedge. On the VC707 each 256-bit beat reaches a 512-bit
+// port through AXIReadMerge + an AXI clock crossing; a burst starting in the upper half of a
+// word, or of odd length, takes paths the native-256 boards never exercise.
+//   fetchtest [tag]
+static int fetchtest(const char *tag)
+{
+    static const uint16_t lens[] = {1, 2, 7, 8, 16, 17, 64, 255, 256};
+    extern int engine_diag;
+    int saved = engine_diag, fails = 0, n = 0;
+    engine_diag = 1;
+    for (int ch = 0; ch < TRIXIUM_N_CHANNELS; ch++)
+        for (unsigned li = 0; li < sizeof(lens)/sizeof(lens[0]); li++)
+            for (int off = 0; off <= 32; off += 32) {
+                uint32_t addr = TRIXIUM_CHAN_WEIGHT_BASE + 0x10000 + li*0x4000 + off;
+                engine_fetch(ch, addr, lens[li], 0xC000);
+                n++;
+                if (engine_wedged) {
+                    fails++;
+                    printf("FETCHTEST %s FAIL ch%d len %u off %d addr %08lx rst_status %lx\n",
+                           tag, ch, lens[li], off, (unsigned long)addr,
+                           (unsigned long)trixium_engine_csr_rst_status_read());
+                    if (engine_recover() < 0) {
+                        printf("FETCHTEST %s abort: engine not recoverable\n", tag);
+                        engine_diag = saved;
+                        return -1;
+                    }
+                }
+            }
+    // Back to back, alternating channels and offsets (the embedding row's shape: 17 beats).
+    for (int i = 0; i < 64 && !engine_wedged; i++, n++)
+        engine_fetch(i & 1, TRIXIUM_CHAN_WEIGHT_BASE + 0x85e0 + (i >> 1)*0x220, 17, 0xC000);
+    if (engine_wedged) {
+        fails++;
+        printf("FETCHTEST %s FAIL back-to-back rst_status %lx\n", tag,
+               (unsigned long)trixium_engine_csr_rst_status_read());
+        engine_recover();
+    }
+    printf("FETCHTEST %s: %d fetches, %d wedged\n", tag, n, fails);
+    engine_diag = saved;
+    return fails;
+}
+
 static void peek_cmd(char *str)
 {
     char *c_s = get_token(&str);
@@ -502,6 +556,33 @@ static void tok_cmd(char *args)
     printf("TOK %d\n", pbuf_n); // Host uses this to confirm the running length.
 }
 
+// Generate up to n tokens from the prompt buffer, appending them to it; `emit` sees each token
+// as it is produced. Shared by genb (ids) and chat (text).
+static int gen_pbuf(int n, const int *stop, int nstop, void (*emit)(int))
+{
+    gen_emit_to_pbuf = 1;
+    infer_set_stop(stop, nstop);
+    infer_set_recent(pbuf, &pbuf_n);      // the repetition penalty's window
+    // Continue from the KV cache when the buffer's head is still what the last genb left
+    // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
+    int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+    int r = infer_generate_from(pbuf, pbuf_n, resident, n, emit);
+    pbuf_kv     = infer_kv_resident();
+    pbuf_serial = infer_gen_serial();
+    infer_set_stop(stop, 0);
+    gen_emit_to_pbuf = 0;
+    return r;
+}
+
+// After the stream (the client reads GEN ERR first): recover a wedged engine.
+static void gen_pbuf_recover(void)
+{
+    if (engine_wedged) {
+        engine_recover();
+        pbuf_kv = 0;              // The KV cache is not trustworthy: the next genb re-forwards.
+    }
+}
+
 // Generate from the accumulated prompt buffer; appends the emitted tokens to it so the
 // next turn continues the conversation without the host resending history. Optional stop
 // ids (the chat template's <|im_end|>) end the reply early; the stop token is emitted and
@@ -522,22 +603,9 @@ static void genb_cmd(char *args)
         return;
     }
     printf("GEN:");
-    gen_emit_to_pbuf = 1;
-    infer_set_stop(stop, nstop);
-    infer_set_recent(pbuf, &pbuf_n);      // the repetition penalty's window
-    // Continue from the KV cache when the buffer's head is still what the last genb left
-    // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
-    int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
-    int r = infer_generate_from(pbuf, pbuf_n, resident, n, emit_token);
-    pbuf_kv     = infer_kv_resident();
-    pbuf_serial = infer_gen_serial();
-    infer_set_stop(stop, 0);
-    gen_emit_to_pbuf = 0;
+    int r = gen_pbuf(n, stop, nstop, emit_token);
     puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
-    if (engine_wedged) {          // Recover here, after the stream: the client reads GEN ERR.
-        engine_recover();
-        pbuf_kv = 0;              // The KV cache is not trustworthy: the next genb re-forwards.
-    }
+    gen_pbuf_recover();
 }
 
 static void gen_cmd(char *args)
@@ -622,6 +690,192 @@ static void selftest(void)
 /* Console Service */
 /*-----------------*/
 
+/* Tokenizer and Chat */
+/*--------------------*/
+
+// The card's own tokenizer (tokenizer.c) over TRIXIUM.TOK in main_ram: text in, text out on
+// the console, no host tools.
+static int tok_check_model(void)
+{
+    const struct bons_header *h = model_header();
+    const uint8_t *t = tok_sha256();
+    int recorded = 0, same = 1;
+    for (int i = 0; h && t && i < 32; i++) {
+        recorded |= h->tokenizer_sha256[i];
+        same &= h->tokenizer_sha256[i] == t[i];
+    }
+    if (!recorded)
+        return 0;                        // Nothing recorded to compare with.
+    if (!same) {
+        puts("tokenizer: TRIXIUM.TOK is not the image's tokenizer (sha256 differs)");
+        return -1;
+    }
+    return 1;
+}
+
+static int tokload(const char *path, int reuse)
+{
+#if MAIN_RAM_SIZE >= 0x07000000
+    uint8_t *tab = (uint8_t *)TRIXIUM_TOKTAB_ADDR;
+    tok_workspace((void *)TRIXIUM_TOKWORK_ADDR);
+    // A table left by the last boot (a CPU reset or a JTAG reload: main_ram keeps it) is kept
+    // when its CRC still holds.
+    if (reuse && tok_attach(tab, TRIXIUM_TOKTAB_SIZE) == 0 && tok_check_model() >= 0) {
+        puts("tokenizer: table in main_ram is intact - kept");
+        return 0;
+    }
+    int n = nfsread(path, tab, TRIXIUM_TOKTAB_SIZE);
+    if (n < 0) {
+        printf("tokenizer: no %s - chat/tokenize/detok unavailable\n", path);
+        return -1;
+    }
+    int r = tok_attach(tab, (uint32_t)n);
+    if (r < 0) {
+        printf("tokenizer: %s is not a valid table (%d)\n", path, r);
+        return -1;
+    }
+    if (tok_check_model() < 0)
+        return -1;
+    printf("tokenizer: %s ready (%d bytes)\n", path, n);
+    return 0;
+#else
+    (void)path; (void)reuse;
+    puts("tokenizer: main_ram too small for the table");
+    return -1;
+#endif
+}
+
+static void print_piece(int id)
+{
+    const uint8_t *p;
+    int n = tok_piece(id, &p);
+    for (int i = 0; i < n; i++)
+        putchar(p[i]);
+}
+
+static void tokenize_cmd(const char *text)
+{
+    int *ids = (int *)TRIXIUM_TOKIDS_ADDR;
+    int n = tok_encode(text, (int)strlen(text), ids, TRIXIUM_CONSOLE_LINE_SIZE);
+    if (n < 0) { puts("tokenize: no tokenizer (tokload)"); return; }
+    printf("TOKENS %d:", n);
+    for (int i = 0; i < n; i++)
+        printf(" %d", ids[i]);
+    printf("\n");
+}
+
+static void detok_cmd(char *args)
+{
+    if (!tok_ready()) { puts("detok: no tokenizer (tokload)"); return; }
+    for (char *t = get_token(&args); *t; t = get_token(&args))
+        print_piece(parse_int(t));
+    printf("\n");
+}
+
+// Chat mode: each console line is a user turn in the Qwen3 chat template (thinking off, as the
+// host client sends it), tokenized here and appended to the prompt buffer; the reply streams
+// as text, one token at a time, until <|im_end|>. /ids shows the token ids as well.
+static int chat_mode, chat_ids, chat_max = 256, chat_turns, chat_closed = 1, chat_im_end = -1;
+static int chat_last;
+
+static void chat_emit(int tok)
+{
+    if (gen_emit_to_pbuf && pbuf_n < PBUF_N)
+        pbuf[pbuf_n++] = tok;
+    chat_last = tok;
+    if (tok != chat_im_end)
+        print_piece(tok);
+    if (chat_ids)
+        printf("[%d]", tok);
+}
+
+static void chat_reset(void)
+{
+    pbuf_n = 0;
+    pbuf_kv = 0;
+    chat_turns = 0;
+    chat_closed = 1;
+}
+
+static void chat_turn(const char *line)
+{
+    static char text[TRIXIUM_CONSOLE_LINE_SIZE + 160];
+    // A continuing conversation closes the previous reply first (one cut short by the token
+    // budget has no <|im_end|> of its own).
+    const char *parts[] = {chat_turns == 0 ? "" : chat_closed ? "\n" : "<|im_end|>\n",
+                           "<|im_start|>user\n", line,
+                           "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"};
+    int len = 0;
+    for (unsigned k = 0; k < sizeof(parts)/sizeof(parts[0]); k++)
+        for (const char *c = parts[k]; *c && len < (int)sizeof(text) - 1; c++)
+            text[len++] = *c;
+    text[len] = 0;
+    if (chat_turns == 0)
+        chat_reset();
+    int room = PBUF_N - pbuf_n - chat_max;
+    int n = room > 0 ? tok_encode(text, len, pbuf + pbuf_n, room) : 0;
+    if (n <= 0 || n == room) {
+        puts("chat: the context is full - /reset to start a new conversation");
+        return;
+    }
+    if (chat_ids) {
+        printf("[query: %d tokens:", n);
+        for (int i = 0; i < n; i++)
+            printf(" %d", pbuf[pbuf_n + i]);
+        printf("]\n");
+    }
+    pbuf_n += n;
+    chat_last = -1;
+    uint64_t t0 = perf_now64();
+    int before = pbuf_n;
+    int r = gen_pbuf(chat_max, &chat_im_end, 1, chat_emit);
+    uint64_t dt = perf_now64() - t0;
+    int got = pbuf_n - before;
+    chat_closed = (chat_last == chat_im_end);
+    chat_turns++;
+    uint32_t ms = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
+    printf("\n[%d tokens, %lu.%02lu tok/s, context %d/%d%s]\n", got,
+           (unsigned long)(ms ? got*1000u/ms : 0), (unsigned long)(ms ? got*100000u/ms % 100 : 0),
+           pbuf_n, PBUF_N, r < 0 ? ", GEN ERR" : "");
+    gen_pbuf_recover();
+}
+
+static void chat_line(char *line)
+{
+    if (strcmp(line, "/exit") == 0) {
+        chat_mode = 0;
+        puts("chat: off");
+    } else if (strcmp(line, "/reset") == 0) {
+        chat_reset();
+        puts("chat: new conversation");
+    } else if (strcmp(line, "/ids") == 0) {
+        chat_ids = !chat_ids;
+        printf("chat: token ids %s\n", chat_ids ? "on" : "off");
+    } else if (strncmp(line, "/max", 4) == 0) {
+        int m = parse_int(line + 4);
+        if (m > 0 && m < PBUF_N/2) chat_max = m;
+        printf("chat: replies up to %d tokens\n", chat_max);
+    } else if (line[0] == '/') {
+        puts("chat: /exit /reset /ids /max <n>");
+    } else if (line[0]) {
+        chat_turn(line);
+    }
+}
+
+static void chat_cmd(char *args)
+{
+    if (!tok_ready()) { puts("chat: no tokenizer (tokload)"); return; }
+    if (!model_header()) { puts("chat: no model loaded"); return; }
+    chat_im_end = tok_lookup("<|im_end|>");
+    if (*args) {
+        int m = parse_int(args);
+        if (m > 0 && m < PBUF_N/2) chat_max = m;
+    }
+    chat_mode = 1;
+    chat_reset();
+    printf("chat: type a message (replies up to %d tokens); /ids /reset /max <n> /exit\n", chat_max);
+}
+
 static void console_service(void)
 {
     char *str, *token;
@@ -629,6 +883,11 @@ static void console_service(void)
     str = readstr();
     if (str == NULL)
         return;
+    if (chat_mode) {
+        chat_line(str);
+        printf(chat_mode ? "you> " : "trixium> ");
+        return;
+    }
     token = get_token(&str);
     if (strcmp(token, "help") == 0)
         help();
@@ -638,6 +897,8 @@ static void console_service(void)
         sptest();
     else if (strcmp(token, "peek") == 0)
         peek_cmd(str);
+    else if (strcmp(token, "fetchtest") == 0)
+        fetchtest(*str ? str : "cmd");
     else if (strcmp(token, "mvtest") == 0)
         mvtest_cmd(str);
     else if (strcmp(token, "mvbw") == 0)
@@ -817,13 +1078,29 @@ static void console_service(void)
                engine_diag ? "on" : "off");
     } else if (strcmp(token, "hdrload") == 0)
         hdrload();
+    else if (strcmp(token, "ethstat") == 0)
+        ethstat();
+    else if (strcmp(token, "ethbench") == 0)
+        ethbench();
+    else if (strcmp(token, "nfsload") == 0) {
+        if (nfsload(strlen(str) ? str : NFSLOAD_DEFAULT) == 0)
+            hdrload();
+    }
     else if (strcmp(token, "sdload") == 0) {
         if (sdload(strlen(str) ? str : SDLOAD_DEFAULT) == 0)
             hdrload();
     }
+    else if (strcmp(token, "tokload") == 0)
+        tokload(strlen(str) ? str : TOKLOAD_DEFAULT, 0);
+    else if (strcmp(token, "tokenize") == 0)
+        tokenize_cmd(str);
+    else if (strcmp(token, "detok") == 0)
+        detok_cmd(str);
+    else if (strcmp(token, "chat") == 0)
+        chat_cmd(str);
     else if (strlen(token))
         puts("unknown command");
-    printf("trixium> ");
+    printf(chat_mode ? "you> " : "trixium> ");
 }
 
 /* Main */
@@ -871,11 +1148,32 @@ int main(void)
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
 #endif
-#ifdef TRIXIUM_SDLOAD
+#if defined(TRIXIUM_NFSLOAD) || defined(TRIXIUM_SDLOAD)
     // No host link to upload with: an image already in the channels (a CPU reset) is kept,
-    // otherwise the SD card's.
-    if (hdrload_staged(1) < 0 && sdload(SDLOAD_DEFAULT) == 0)
-        hdrload_staged(0);
+    // otherwise the SD card's, then the NFS export's.
+    ethbench();
+    // A JTAG reload keeps the SODIMM powered, so a previous image's header survives and
+    // would be reused - with weights that went unrefreshed through the reconfiguration.
+    // TRIXIUM_FORCE_LOAD reloads regardless.
+#ifdef TRIXIUM_FORCE_LOAD
+    if (1) {
+#else
+    if (hdrload_staged(1) < 0) {
+#endif
+        int rc = -1;
+#if defined(TRIXIUM_SDLOAD)
+        rc = sdload(SDLOAD_DEFAULT);
+#endif
+#if defined(TRIXIUM_NFSLOAD)
+        if (rc != 0)
+            rc = nfsload(NFSLOAD_DEFAULT);
+#endif
+        if (rc == 0)
+            hdrload_staged(0);
+    }
+#if defined(TRIXIUM_NFSLOAD)
+    tokload(TOKLOAD_DEFAULT, 1);
+#endif
 #else
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
 #endif
@@ -950,8 +1248,14 @@ int main(void)
     }
     selftest();
     SIM_MARK("selftests");
+#ifdef TRIXIUM_FETCHTEST_BOOT
+    fetchtest("post-selftest");
+#endif
     hwops_init();
     if (infer_init() == 0) {
+#ifdef TRIXIUM_FETCHTEST_BOOT
+        fetchtest("post-infer-init");
+#endif
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
         // The legs that only exist for the gate are skipped on big models (the all-CPU
@@ -997,6 +1301,26 @@ int main(void)
             infer_generate(prompt, 3, 2, emit_token);
             puts("\nGEN-HW DONE");
             perf_print();
+#ifdef TRIXIUM_CPUREF_BOOT
+            // The all-CPU reference for the same prompt (the leg big models skip at boot):
+            // its tokens must match GEN-HW's.
+            hwops_set_all(0);
+            printf("GEN-CPU:");
+            perf_reset();
+            infer_generate(prompt, 3, 2, emit_token);
+            puts("\nGEN-CPU DONE");
+            perf_print();
+            hwops_set_all(1);
+#endif
+#ifdef TRIXIUM_FETCHTEST_BOOT
+            if (engine_wedged && engine_recover() == 0) {
+                extern int engine_pf_use;
+                engine_pf_use = 0;
+                printf("GEN-HW (prefetch off):");
+                infer_generate(prompt, 3, 2, emit_token);
+                puts(engine_wedged ? "\nGEN-HW (prefetch off) WEDGED" : "\nGEN-HW (prefetch off) DONE");
+            }
+#endif
         }
     }
 boot_demo_done:

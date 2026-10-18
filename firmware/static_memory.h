@@ -26,4 +26,11 @@
 #define TRIXIUM_LISTPROF_ADDR       (TRIXIUM_HDR_ADDR + 0xc2000) // struct list_prof[16] (resident.c), 8.25 KB
 #define TRIXIUM_RL_STATE_ADDR       (TRIXIUM_HDR_ADDR + 0xc6000) // struct rl_state (resident.c), < 1 KB
 
+// The tokenizer table (TRIXIUM.TOK, tokenizer.c), on boards whose main_ram reaches past it:
+// main_ram + 96 MB, between the load buffers (+64 MB, 16 MB) and the high heap (>= +144 MB).
+#define TRIXIUM_TOKTAB_ADDR (MAIN_RAM_BASE + 0x06000000u)
+#define TRIXIUM_TOKTAB_SIZE 0x00F00000u                         // The table, at most 15 MB,
+#define TRIXIUM_TOKWORK_ADDR (TRIXIUM_TOKTAB_ADDR + 0x00F00000u) // then the encoder's arrays
+#define TRIXIUM_TOKIDS_ADDR  (TRIXIUM_TOKTAB_ADDR + 0x00F80000u) // and `tokenize`'s ids.
+
 #endif

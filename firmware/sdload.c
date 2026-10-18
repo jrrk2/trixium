@@ -33,7 +33,7 @@
 #include <liblitesdcard/sdcard.h>
 #include <libfatfs/ff.h>
 
-#include "bons.h"
+#include "imgfeed.h"
 
 #ifndef SD_CLK_HZ
 #define SD_CLK_HZ 50000000         // SDR25 (liblitesdcard's init leaves the bus at 25 MHz).
@@ -41,8 +41,6 @@
 #define SD_DMA_MAX_SECTORS 256u    // 128 KB per command, inside the PHY's 1 s data timeout.
 #define SD_BUF       (MAIN_RAM_BASE + 0x04000000u) // main_ram + 64 MB: between the low heap
 #define SD_BUF_SIZE  0x01000000u                   // (< 64 MB) and the high heap (>= 144 MB).
-#define HDR_STAGING  (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
-#define CHUNK_BEATS  (4u << 20)    // The loader's 24-bit beat count: 128 MB per armed transfer.
 
 static int sd_ready;
 
@@ -73,7 +71,7 @@ static uint32_t fat_next(FATFS *fs, uint32_t clst)
     else return 0xFFFFFFFFu;
     if (fat_cached_sec != sec) {
         if (sdcard_read(sec, 1, fatbuf) != 0) return 0xFFFFFFFFu;
-        flush_cpu_dcache();
+        flush_cpu_dcache_range(fatbuf, sizeof(fatbuf)); // Not flush_cpu_dcache(): all of main_ram.
         fat_cached_sec = sec;
     }
     if (fs->fs_type == FS_FAT32) return (*(uint32_t *)(fatbuf + off)) & 0x0FFFFFFFu;
@@ -139,104 +137,8 @@ static int64_t sd_stream_read(struct sd_stream *s, uint8_t *dst)
     }
     if (got > s->left) got = (uint32_t)s->left;
     s->left -= got;
-    flush_cpu_dcache();
+    flush_cpu_dcache_range(dst, got);      // The DMA'd run only (a whole flush walks main_ram).
     return got;
-}
-
-/* Loader */
-/*--------*/
-
-static int loader_wait(void)
-{
-    for (uint32_t t = 0; t < 2000000; t++) {
-        if (trixium_loader_status_read() & 1) return 0;
-        busy_wait_us(10);
-    }
-    uint32_t st = trixium_loader_status_read();
-    printf("\nsdload: loader timeout (status %08lx, %lu beats)\n",
-           (unsigned long)st, (unsigned long)((st >> 8) & 0xFFFFFF));
-    return -1;
-}
-
-static void loader_arm(uint32_t chan, uint32_t base, uint32_t beats)
-{
-    trixium_loader_src_sel_write(1);
-    trixium_loader_chan_write(chan);
-    trixium_loader_base_write(base);
-    trixium_loader_length_write(beats);
-    trixium_loader_resync_write(0);
-    trixium_loader_start_write(1);
-}
-
-/* The image as a list of transfers, fed from the file in order: segment k covers file bytes
- * [off, off + bytes) and goes to (chan, base), zero-padded to whole beats and armed in
- * CHUNK_BEATS pieces. */
-struct seg { uint32_t chan, base; uint64_t off, bytes; };
-
-struct feeder {
-    const struct seg *segs;
-    int      nseg, k;
-    uint64_t done;      // Bytes of segs[k] poked.
-    uint32_t piece;     // Beats left in the armed piece (0: none armed).
-    uint32_t piece_words;
-};
-
-static int feed_arm_next(struct feeder *f)
-{
-    const struct seg *s = &f->segs[f->k];
-    uint64_t total = (s->bytes + 31)/32;
-    uint64_t start = f->done/32;
-    uint32_t beats = (uint32_t)(total - start > CHUNK_BEATS ? CHUNK_BEATS : total - start);
-    loader_arm(s->chan, s->base + (uint32_t)(start*32), beats);
-    f->piece = beats;
-    f->piece_words = beats*8;
-    return 0;
-}
-
-static void poke(uint32_t w)
-{
-    trixium_loader_poke_write(w);
-}
-
-/* Poke the words of [pos, pos + n) of the file (pos 4-aligned). */
-static int feed(struct feeder *f, uint64_t pos, const uint32_t *w, uint32_t nwords)
-{
-    for (uint32_t i = 0; i < nwords; i++, pos += 4) {
-        while (f->k < f->nseg && pos >= f->segs[f->k].off + f->segs[f->k].bytes) {
-            // Segment complete: pad its last beat, finish the piece.
-            while (f->piece_words) { poke(0); f->piece_words--; }
-            if (f->piece && loader_wait() < 0) return -1;
-            f->piece = 0; f->k++; f->done = 0;
-        }
-        if (f->k >= f->nseg) return 0;
-        if (pos < f->segs[f->k].off) continue;          // Gap between segments: skip.
-        if (f->piece_words == 0) {
-            if (f->piece && loader_wait() < 0) return -1;
-            feed_arm_next(f);
-        }
-        if ((f->piece_words & 0xFF) == 0)
-            while (trixium_loader_status_read() & 4)    // FIFO full.
-                ;
-        poke(w[i]);
-        f->piece_words--;
-        f->done += 4;
-    }
-    return 0;
-}
-
-static int feed_finish(struct feeder *f)
-{
-    while (f->k < f->nseg) {
-        while (f->piece_words) { poke(0); f->piece_words--; }
-        if (f->piece && loader_wait() < 0) return -1;
-        f->piece = 0;
-        if (f->done < f->segs[f->k].bytes) {
-            puts("\nsdload: file ended inside a segment");
-            return -1;
-        }
-        f->k++; f->done = 0;
-    }
-    return 0;
 }
 
 /* sdload */
@@ -252,50 +154,27 @@ int sdload(const char *name)
     uint32_t clst = fil.obj.sclust;
     f_close(&fil);
     if (fs.fs_type != FS_FAT32 && fs.fs_type != FS_FAT16) { puts("sdload: not FAT16/32"); return -1; }
-    if (clst < 2 || len < sizeof(struct bons_header)) { printf("sdload: %s is empty\n", name); return -1; }
+    if (clst < 2 || len == 0) { printf("sdload: %s is empty\n", name); return -1; }
 
     fat_cached_sec = 0xFFFFFFFFu;
     struct sd_stream s = { &fs, clst, 0, len };
     uint8_t *buf = (uint8_t *)SD_BUF;
     int64_t n = sd_stream_read(&s, buf);
-    if (n < (int64_t)sizeof(struct bons_header)) return -1;
+    if (n <= 0) return -1;
+    printf("sdload: %s\n", name);
+    if (imgfeed_begin(buf, (uint32_t)n, len) < 0) return -1;
 
-    const struct bons_header *h = (const struct bons_header *)buf;
-    if (h->magic != BONS_MAGIC) { printf("sdload: %s is not a BONS image\n", name); return -1; }
-    if (h->n_channels != TRIXIUM_N_CHANNELS) {
-        printf("sdload: image has %lu channels, the gateware %d (convert --board vc707)\n",
-               (unsigned long)h->n_channels, TRIXIUM_N_CHANNELS);
-        return -1;
-    }
-    uint64_t chan_bytes = h->payload_beats*32;
-    if (h->payload_offset % 4 || len < h->payload_offset + h->n_channels*chan_bytes) {
-        puts("sdload: truncated image");
-        return -1;
-    }
-    struct seg segs[1 + 32];
-    int nseg = 0;
-    segs[nseg++] = (struct seg){ 0, HDR_STAGING, 0, h->payload_offset };
-    for (uint32_t c = 0; c < h->n_channels; c++)
-        segs[nseg++] = (struct seg){ c, TRIXIUM_CHAN_WEIGHT_BASE,
-                                     h->payload_offset + c*chan_bytes, chan_bytes };
-    printf("sdload: %s, %lu layers, %lu channels x %lu KB\n", name, (unsigned long)h->n_layer,
-           (unsigned long)h->n_channels, (unsigned long)(chan_bytes/1024));
-
-    uint64_t total = h->payload_offset + h->n_channels*chan_bytes;
-    struct feeder f = { segs, nseg, 0, 0, 0, 0 };
-    uint64_t pos = 0;
+    uint64_t total = imgfeed_total(), pos = 0;
     init_progression_bar(total);
     while (1) {
-        uint32_t words = (uint32_t)((n + 3)/4);
-        if (n & 3) memset(buf + n, 0, 4 - (n & 3));
-        if (feed(&f, pos, (const uint32_t *)buf, words) < 0) return -1;
+        if (imgfeed_push(buf, (uint32_t)n) < 0) return -1;
         pos += n;
         show_progress(pos < total ? pos : total);
         if (pos >= total || s.left == 0) break;
         n = sd_stream_read(&s, buf);
         if (n <= 0) return -1;
     }
-    if (feed_finish(&f) < 0) return -1;
+    if (imgfeed_end() < 0) return -1;
     printf("\nsdload: %lu MB loaded\n", (unsigned long)(total >> 20));
     return 0;
 }

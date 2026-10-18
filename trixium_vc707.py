@@ -9,9 +9,9 @@
 """TriXium on the Xilinx VC707 (XC7VX485T-2, one 64-bit DDR3 SODIMM, 1 GB MT8JTF12864).
 
 A port of the YPCB-00338 target (trixium_ypcb.py) to a single DDR3 controller and no host
-link: the console is the board's USB-UART and the weights come from the SD card (the
-firmware's `sdload` reads the BONS image with FatFs and pokes it into the loader, the CSR
-path the PCIe host tools use). The DDR3 sits on HP banks: LiteDRAM's V7DDRPHY with ODELAY
+link: the console is the board's USB-UART, the firmware boots over TFTP and the weights come over NFS (the
+firmware's `nfsload` reads the BONS image from the host's export with NFSv3 over UDP and
+pokes it into the loader, the CSR path the PCIe host tools use). The DDR3 sits on HP banks: LiteDRAM's V7DDRPHY with ODELAY
 write leveling, DDR3-800 in a 100 MHz ddr domain by default (the rate this board's other
 LiteX designs run at; --ddr-clk-freq 125e6 for DDR3-1000, the upstream litex-boards target's).
 
@@ -56,6 +56,14 @@ from gateware.common import set_main_ram_executable
 from gateware.common import set_vivado_env, write_verdict
 
 VIVADO_2020 = "/opt/Xilinx/Vivado/2020.1"
+
+# Ethernet: the board's SGMII PHY through the LiteEth 1000BASE-X PCS wrapper that xc7-bitstream-tools
+# proved on this board (examples/vc707-litex: EthminSGMIIPHY + vc707-ethmin/rtl/liteeth_sgmii_phy.v).
+XC7_TOOLS   = os.environ.get("XC7_BITSTREAM_TOOLS", os.path.expanduser("~/xc7-bitstream-tools"))
+LOCAL_IP    = "192.168.1.50"
+REMOTE_IP   = "192.168.1.106"      # TFTP (firmware) and NFS (BONS image) server.
+MAC_ADDRESS = 0x10e2d5545258       # "TRX": the TFTP server's per-MAC boot directory.
+TFTP_PORT   = 6969
 
 # The SODIMM has DM pins: the controller writes partial words with byte masks, the engine
 # ports need no read-modify-write.
@@ -151,6 +159,8 @@ class TriXiumVC707SoC(SoCCore):
         main_ram_size  = 0x1000_0000,
         chan_stride    = None,
         chan_skew      = None,
+        eth_sf         = True,
+        with_sdcard    = False,
         read_time      = 256,
         write_time     = 128,
         refresh_postponing = 1,
@@ -201,8 +211,50 @@ class TriXiumVC707SoC(SoCCore):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
 
-        # SD card (weights, firmware) --------------------------------------------------------------
-        self.add_sdcard()
+        # SD card (optional second image source: `sdload`) -----------------------------------------
+        if with_sdcard:
+            self.add_sdcard()
+            self.add_constant("TRIXIUM_SDLOAD", 1)
+
+        # Ethernet (firmware over TFTP, weights over NFS) ------------------------------------------
+        sys.path.insert(0, os.path.join(XC7_TOOLS, "examples", "vc707-litex"))
+        from vc707_litex import EthminSGMIIPHY
+        eth = platform.request("eth")
+        class _DataPads: pass
+        data_pads = _DataPads()
+        data_pads.txp, data_pads.txn = eth.tx_p, eth.tx_n
+        data_pads.rxp, data_pads.rxn = eth.rx_p, eth.rx_n
+        self.comb += [eth.rst_n.eq(1), eth.mdc.eq(0)] # 1000BASE-X autoneg needs no MDIO.
+        # The wrapper's GT reset timers were sized on a 100 MHz clk_int (its sys): the ddr clock.
+        self.ethphy = ClockDomainsRenamer({"sys": "ddr"})(EthminSGMIIPHY(
+            platform    = platform,
+            refclk_pads = platform.request("sgmii_clock"),
+            data_pads   = data_pads))
+        # Whole frames buffered on the 125 MHz side before they go out (and in): the ethmin
+        # architecture, a MAC that need not keep up with the line mid-frame. LiteEth's "auto"
+        # choice leaves TX unbuffered at 32 bits x 120 MHz (added while the GT clocks were still
+        # untimed, so not proven needed: --no-eth-sf builds without it).
+        self.ethphy.with_store_and_forward = eth_sf
+        # 16 RX slots: the NFS loader keeps several 1 KB READ replies in flight.
+        self.add_ethernet(phy=self.ethphy, local_ip=LOCAL_IP, remote_ip=REMOTE_IP,
+            mac_address=MAC_ADDRESS, nrxslots=16, with_timing_constraints=False)
+        self.add_constant("TFTP_SERVER_PORT", TFTP_PORT)
+        # Timing: the wrapper's clocks all derive from the GT's TXOUTCLK/RXOUTCLK (1.25 Gb/s / 20 =
+        # 62.5 MHz, each into an MMCM making the 62.5/125 MHz PCS/GMII pairs), as in the standalone
+        # ethmin constraints. LiteX's primary clocks on the eth_tx/eth_rx nets leave the GT side
+        # unclocked (Vivado derives nothing from a raw GTXE2: 39 registers with no clock, the
+        # GT <-> GMII paths untimed). After synthesis, when the pins and the SoC clocks exist.
+        gt = "liteeth_sgmii_phy/GTXE2_CHANNEL"
+        platform.toolchain.pre_placement_commands.append(
+            f"create_clock -name eth_txoutclk -period 16.000 [get_pins {gt}/TXOUTCLK]")
+        platform.toolchain.pre_placement_commands.append(
+            f"create_clock -name eth_rxoutclk -period 16.000 [get_pins {gt}/RXOUTCLK]")
+        platform.toolchain.pre_placement_commands.append(
+            "set_clock_groups -asynchronous"
+            " -group [get_clocks -include_generated_clocks eth_txoutclk]"
+            " -group [get_clocks -include_generated_clocks eth_rxoutclk]"
+            " -group [get_clocks sgmii_clock_p]"
+            " -group [get_clocks -include_generated_clocks clk200_p]")
 
         # Leds -------------------------------------------------------------------------------------
         self.leds = LedChaser(
@@ -241,11 +293,11 @@ class TriXiumVC707SoC(SoCCore):
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
 
-        # No DMA source: uploads use the loader's CSR poke path (firmware sdload).
+        # No DMA source: uploads use the loader's CSR poke path (firmware nfsload).
         self.comb += self.trixium.upload.valid.eq(0)
 
         # Board memory map, for the firmware.
-        self.add_constant("TRIXIUM_SDLOAD", 1)
+        self.add_constant("TRIXIUM_NFSLOAD", 1)
         self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)
         self.add_constant("TRIXIUM_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
         self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
@@ -282,6 +334,8 @@ def main():
     parser.add_target_argument("--trit5",              action=argparse.BooleanOptionalAction, default=True,  help="Unpackers for 5-trits-per-byte weights.")
     parser.add_target_argument("--prefetch",           default=2048,     type=int,                            help="Weight prefetch: reader FIFO beats per channel (0: none).")
     parser.add_target_argument("--vec-fused",          action=argparse.BooleanOptionalAction, default=True,  help="Vector unit with the fused clamp/round instructions.")
+    parser.add_target_argument("--with-sdcard",        action="store_true",                                   help="SD card controller (firmware sdload; tried before NFS at boot).")
+    parser.add_target_argument("--eth-sf",             action=argparse.BooleanOptionalAction, default=True,  help="Ethernet store-and-forward packet FIFOs at the PHY.")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_2020), help="Vivado install sourced by the build (settings64.sh).")
     parser.set_defaults(
         cpu_type                             = "vexiiriscv",
@@ -310,6 +364,8 @@ def main():
         prefetch           = args.prefetch,
         vec_fused          = args.vec_fused,
         chan_stride        = args.chan_stride,
+        eth_sf             = args.eth_sf,
+        with_sdcard        = args.with_sdcard,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 
