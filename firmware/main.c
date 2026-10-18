@@ -308,18 +308,23 @@ static void bench_cmd(char *args)
 static int gen_emit_to_pbuf;
 // Chunked prompt buffer (tok/genb), in the main_ram static window (static_memory.h), not
 // .bss: TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000).
-// Sized to the KV budget (the image's max_ctx, 2048 for the 1.7B): a
-// conversation can use the whole context.
-#define PBUF_N 2048
+// Room for 4096 tokens (16 KB of the 128 KB to +0xC0000); a conversation can use the whole
+// context, the image's max_ctx (pbuf_cap()).
+#define PBUF_N 4096
 static int *const pbuf = (int *)(TRIXIUM_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
+static int pbuf_cap(void)
+{
+    int c = infer_context_capacity();
+    return (c > 0 && c < PBUF_N) ? c : PBUF_N;
+}
 static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the last genb)...
 static uint32_t pbuf_serial;  // ...as long as no other generation ran since.
 
 static void emit_token(int tok)
 {
     printf(" %d", tok);
-    if (gen_emit_to_pbuf && pbuf_n < PBUF_N)
+    if (gen_emit_to_pbuf && pbuf_n < pbuf_cap())
         pbuf[pbuf_n++] = tok;
 }
 
@@ -550,7 +555,7 @@ static void tok_cmd(char *args)
             printf("TOK ERR bad id %d (vocab %lu)\n", id, (unsigned long)vocab);
             return;
         }
-        if (pbuf_n < PBUF_N)
+        if (pbuf_n < pbuf_cap())
             pbuf[pbuf_n++] = id;
     }
     printf("TOK %d\n", pbuf_n); // Host uses this to confirm the running length.
@@ -780,7 +785,7 @@ static int chat_last;
 
 static void chat_emit(int tok)
 {
-    if (gen_emit_to_pbuf && pbuf_n < PBUF_N)
+    if (gen_emit_to_pbuf && pbuf_n < pbuf_cap())
         pbuf[pbuf_n++] = tok;
     chat_last = tok;
     if (tok != chat_im_end)
@@ -812,7 +817,7 @@ static void chat_turn(const char *line)
     text[len] = 0;
     if (chat_turns == 0)
         chat_reset();
-    int room = PBUF_N - pbuf_n - chat_max;
+    int room = pbuf_cap() - pbuf_n - chat_max;
     int n = room > 0 ? tok_encode(text, len, pbuf + pbuf_n, room) : 0;
     if (n <= 0 || n == room) {
         puts("chat: the context is full - /reset to start a new conversation");
@@ -836,7 +841,7 @@ static void chat_turn(const char *line)
     uint32_t ms = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
     printf("\n[%d tokens, %lu.%02lu tok/s, context %d/%d%s]\n", got,
            (unsigned long)(ms ? got*1000u/ms : 0), (unsigned long)(ms ? got*100000u/ms % 100 : 0),
-           pbuf_n, PBUF_N, r < 0 ? ", GEN ERR" : "");
+           pbuf_n, pbuf_cap(), r < 0 ? ", GEN ERR" : "");
     gen_pbuf_recover();
 }
 
@@ -852,8 +857,12 @@ static void chat_line(char *line)
         chat_ids = !chat_ids;
         printf("chat: token ids %s\n", chat_ids ? "on" : "off");
     } else if (strncmp(line, "/max", 4) == 0) {
-        int m = parse_int(line + 4);
-        if (m > 0 && m < PBUF_N/2) chat_max = m;
+        const char *a = line + 4;
+        while (*a == ' ')
+            a++;
+        int m = parse_int(a);
+        if (m > 0 && m < pbuf_cap()/2) chat_max = m;
+        else printf("chat: /max takes 1..%d\n", pbuf_cap()/2 - 1);
         printf("chat: replies up to %d tokens\n", chat_max);
     } else if (line[0] == '/') {
         puts("chat: /exit /reset /ids /max <n>");
@@ -869,7 +878,8 @@ static void chat_cmd(char *args)
     chat_im_end = tok_lookup("<|im_end|>");
     if (*args) {
         int m = parse_int(args);
-        if (m > 0 && m < PBUF_N/2) chat_max = m;
+        if (m > 0 && m < pbuf_cap()/2) chat_max = m;
+        else printf("chat: the reply limit takes 1..%d\n", pbuf_cap()/2 - 1);
     }
     chat_mode = 1;
     chat_reset();

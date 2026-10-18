@@ -88,7 +88,7 @@ def cmd_convert(args):
     manifest = out.rsplit(".", 1)[0] + ".json"
     convert(args.gguf, args.channels, out, manifest, tokenizer, args.layers, args.check,
             emb16=not args.no_emb16, chan_stride=chan_stride, window=window,
-            window_reserve=window_reserve, trit5=args.trit5)
+            window_reserve=window_reserve, trit5=args.trit5, max_ctx=args.max_ctx)
     print(f"{out}\n{manifest}")
 
 
@@ -227,6 +227,7 @@ def main(argv=None):
     p.add_argument("--check",     action="store_true",  help="Read two tensors back and compare.")
     p.add_argument("--no-emb16",  action="store_true",  help="Leave out the int16 embedding table (-622 MB, ~2.6%% slower per token).")
     p.add_argument("--trit5",     action=argparse.BooleanOptionalAction, default=None, help="Ternary weights 5 trits per byte (bitstreams built with --trit5; default: the board's, on for ypcb).")
+    p.add_argument("--max-ctx",   type=int,             help="Context in positions: the KV budget (default 2048; the firmware serves up to 6144).")
     p.set_defaults(fn=cmd_convert)
 
     # Verify.

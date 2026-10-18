@@ -33,7 +33,7 @@ import fcntl
 DEFAULT_TTY       = "/dev/ttyLXU0"
 DEFAULT_TOKENIZER = "models/1.7b/tokenizer.json"
 PROMPT            = b"trixium> "
-PBUF_TOKENS       = 2048  # On-card conversation buffer (firmware/main.c PBUF_N, = max_ctx).
+PBUF_TOKENS       = 2048  # On-card conversation buffer: the image's max_ctx (firmware/main.c pbuf_cap(), 2048 by default).
 LINE_MAX          = 850   # Firmware console line buffer is 1024 B; leave slack.
 STATE_DIR         = "/tmp/trixium"  # Card state for trixium_smi (trixium_loader.h).
 

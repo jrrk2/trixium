@@ -138,7 +138,8 @@ static inline int f32_quant_e8(const float *src, uint32_t n)
 #define SP_D    0x2C000 // Projection-result int16 (residual addend).
 #define SP_FET  0x30000 // Fetch staging (embedding rows, norm16 rows).
 #define SP_KVP  0x34000 // KV row-packet staging (built by CPU, engine-stored to HBM).
-#define SP_SC   0x36000 // Engine score results (int32, position-major).
+#define SP_SC0  0x36000 // Engine score results (int32, position-major): 2048 positions to SP_Q.
+#define SP_SC   sp_sc   // Where they are: SP_SC0, or SP_U past 2048 positions (infer_init).
 #define SP_AW   SP_Y            // Attention: AXPY partials + reduce/norm scratch (free here).
 #define SP_AWP8 (SP_Y + 0x2000) // Per-head softmax p8-sum spill beats (32 B each).
 #define SP_AWAM (SP_Y + 0x2400) // Per-head reduce-absmax spill beats (32 B each).
@@ -221,6 +222,8 @@ static inline uint32_t cpu_addr_of(uint64_t eng) // Engine-side -> CPU address (
 #define SP_LUTQ   (SP_DESC + 188*64)    // 32 x int32 eps for the q norm (descriptor slots
 #define SP_LUTK   (SP_LUTQ + 128)       // 188-191, past every list).
 #define SP_SCB2   sp_scb2               // Second attention scores buffer (0 = none).
+extern uint32_t sp_sc;                  // The scores buffer (SP_SC).
+void attn_sc_repad(void);               // Rewrite its padding after SP_U was overwritten.
 
 // seq_eps_int cache, index es+64; 0 = not computed yet. int32 over [-64, 63]: the qkvx LUT
 // fill asks for 32 es values per norm per layer (including the big-eps, very negative es

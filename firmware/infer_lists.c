@@ -254,7 +254,10 @@ static int attn_chunk_cap = 0;   // Debug: cap the heads per list (0 = as many a
 // gets the free half of SP_D instead (the resident k-norm rows that live there on the 1.7B
 // are impossible at 36 layers, see qres), 8 KB = the full 2048-position budget. Not SP_YU:
 // the FFN's up results overwrite it every layer. Neither fits: the deep layout stays off.
-// Buffer A is safe: ceil32(cnt) <= 2048 = max_ctx ends it exactly at SP_Q.
+// Buffer A (SP_SC) is safe: at SP_SC0, ceil32(cnt) <= 2048 ends it exactly at SP_Q; a longer
+// context moves it to SP_U (infer_init), which only the op-path FFN writes - and that
+// rewrites the padding (attn_sc_repad).
+uint32_t sp_sc = SP_SC0;   // Scores buffer A.
 uint32_t sp_scb2;          // Second scores buffer (0 = no deep layout possible).
 uint32_t sc_b_cap_bytes;   // Its capacity.
 #define SC_B_CAP_BYTES sc_b_cap_bytes
@@ -885,4 +888,17 @@ void attn_list_prep_token(int pos)
         seq_patch(attn_di_wv(j), 5, wlen);
     }
     attn_prep_pos = pos;
+}
+
+// SP_U also holds the op-path FFN's int16 up: when buffer A lives there, put back the
+// INT32_MIN padding attn_list_prep_token wrote for this forward (the list's softmax reads it).
+void attn_sc_repad(void)
+{
+    if (SP_SC != SP_U || attn_prep_pos < 0)
+        return;
+    int cnt  = attn_prep_pos + 1;
+    int padn = SC_PADN(cnt);
+    volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+    for (int i2 = 0; i2 < padn; i2++)
+        sc32[cnt + i2] = (int32_t)0x80000000;
 }

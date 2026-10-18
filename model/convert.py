@@ -199,7 +199,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
-            window=None, window_reserve=0, kseg_max=layout.KSEG_MAX, trit5=False):
+            window=None, window_reserve=0, kseg_max=layout.KSEG_MAX, trit5=False, max_ctx=None):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     try:
@@ -208,6 +208,10 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         # The image is still built: the firmware refuses at boot what it cannot run, and
         # the tools (the mirrors, the golden) read the image meanwhile.
         print(f"  NOTE: {e}")
+    if max_ctx is not None:
+        # The KV budget (KV regions + rope tables), not the model's native limit; the firmware
+        # serves up to 6144 (its scores buffer).
+        cfg.max_ctx = max_ctx
     if max_layers is not None:
         cfg.n_layer = min(cfg.n_layer, max_layers)
         cfg.name    = f"{cfg.name}-l{cfg.n_layer}"
@@ -362,6 +366,7 @@ def main():
     p.add_argument("--window",         default=None, type=_int,           help="Channel window from its base (TRIXIUM_CHAN_WINDOW, default: up to the next stride boundary).")
     p.add_argument("--window-reserve", default=0,    type=_int,           help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
     p.add_argument("--kseg-max",       default=layout.KSEG_MAX, type=int, help="Split matvecs wider than this (K-segments).")
+    p.add_argument("--max-ctx",        default=None, type=int,            help="Context (KV budget) in positions (default: the config's, 2048).")
     p.add_argument("--trit5",          action="store_true",               help="Streamed ternary weights 5 trits per byte (with_trit5 engines).")
 
     # Verify.
@@ -376,7 +381,8 @@ def main():
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
                 chan_stride=args.chan_stride, weight_base=args.weight_base,
-                window=args.window, window_reserve=args.window_reserve, kseg_max=args.kseg_max, trit5=args.trit5)
+                window=args.window, window_reserve=args.window_reserve, kseg_max=args.kseg_max, trit5=args.trit5,
+                max_ctx=args.max_ctx)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

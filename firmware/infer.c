@@ -1379,6 +1379,7 @@ attn_heads_done: ;
 
             int es = eg + eu + 15;
             int es8 = es + op_silu_q8_sp(SP_G, eg, SP_U, eu, ffn_dim, SP_X);
+            attn_sc_repad(); // The up in SP_U may have covered the scores' padding.
             dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
             if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
 
@@ -1623,10 +1624,26 @@ int infer_init(void)
         fold_nrep_sh = sh;
     }
     qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
+    // Scores buffer A holds a whole context of int32 scores (padded to SC_PAD). SP_SC0 has
+    // room for 2048 positions; a longer context takes SP_U (24 KB: 6144 positions), the
+    // op-path FFN's int16 up that the list path never writes - when the gate (SP_G) stays
+    // out of it. (The hybrid forward, hybrid.c, has its own attention buffers.)
+    {
+        uint32_t need = (((uint32_t)H->max_ctx + SC_PAD - 1u) & ~(uint32_t)(SC_PAD - 1))*4u;
+        if (hybrid_present() || need <= (uint32_t)(SP_Q - SP_SC0)) {
+            sp_sc = SP_SC0;
+        } else if (need <= (uint32_t)(SP_D - SP_U) && 2u*(uint32_t)ffn_dim <= (uint32_t)(SP_U - SP_G)) {
+            sp_sc = SP_U;
+        } else {
+            printf("infer: a %lu-position context does not fit the scores buffer\n",
+                   (unsigned long)H->max_ctx);
+            return -6;
+        }
+    }
     {
         int q_bytes = 2*n_head*head_dim, kn_bytes = 2*n_layer*head_dim;
         if (q_bytes <= 0x1800) {                       // 1.7B: the tail of the q region
-            sp_scb2 = (uint32_t)SP_SC + 0x3800u;
+            sp_scb2 = (uint32_t)SP_SC0 + 0x3800u;
             sc_b_cap_bytes = (uint32_t)SP_K - sp_scb2;
         } else if (2*n_embd <= 0x2000 && kn_bytes > 0x1C00) { // 8B: SP_D's free half
             sp_scb2 = (uint32_t)SP_D + 0x2000u;
@@ -1769,7 +1786,7 @@ int infer_init(void)
     eps_init();
     rope_init();
 
-    // 16 KV staging slots fill SP_KVP exactly (16 x 512 B, ending at SP_SC). A model with
+    // 16 KV staging slots fill SP_KVP exactly (16 x 512 B, ending at SP_SC0). A model with
     // more KV heads would run the last slots into the score buffer and corrupt attention with
     // no other symptom, so refuse rather than discover it as wrong tokens.
     if (2*n_kv_head > KVP_SLOTS) {
