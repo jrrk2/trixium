@@ -31,6 +31,11 @@ from litex.soc.interconnect import stream
 
 # Constants ----------------------------------------------------------------------------------------
 
+# Row index width (rows per channel): the engine command's `rows`, the pipes' row counters and
+# the result stream's row tags. 16 bits capped a channel at 65535 rows - a 151669-row LM head
+# on two channels (75835 each) wrapped, and the readers were left holding the rest of it.
+ROW_BITS = 20
+
 KIND_OP_TERNARY = 0
 KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
@@ -80,7 +85,7 @@ class ChannelPipe(LiteXModule):
         # Op parameters (quasi-static while busy; registered by the engine every cycle, reset-less:
         # an op only reads them from `start` on).
         self.kind        = Signal(2,  reset_less=True)
-        self.rows        = Signal(16, reset_less=True)
+        self.rows        = Signal(ROW_BITS, reset_less=True)
         self.scale_beats = Signal(4,  reset_less=True) # Scale beats per row (>= 1).
         self.code_beats  = Signal(8,  reset_less=True) # Code beats (= groups) per row.
         self.bias        = Signal(7,  reset_less=True) # B.
@@ -94,7 +99,7 @@ class ChannelPipe(LiteXModule):
         # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
         # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
         # head (gather adds the qstride offset when set) is always 0.
-        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
+        self.source = stream.Endpoint([("row", ROW_BITS), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
         self.xw_group = Signal(max=max(xbuf_groups, 2))
@@ -134,7 +139,7 @@ class ChannelPipe(LiteXModule):
         phase   = Signal() # 0: scale beats, 1: code beats.
         s_cnt   = Signal(4)
         g_cnt   = Signal(8)
-        row_cnt = Signal(16)
+        row_cnt = Signal(ROW_BITS)
 
         accept   = Signal()
         is_code  = Signal()
@@ -481,7 +486,7 @@ class ChannelPipe(LiteXModule):
         shamt  = Signal(6, reset_less=True) # Saturated at T+1 (>>45 of a 46-bit value = sign only),
                                    # so T+2 is register -> 46-bit shifter -> register.
         v3     = Signal()
-        row3   = Signal(16, reset_less=True)
+        row3   = Signal(ROW_BITS, reset_less=True)
         rlast3 = Signal(reset_less=True)
         self.comb += [
             bias_s.eq(self.bias),
@@ -498,7 +503,7 @@ class ChannelPipe(LiteXModule):
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>) -------
         contrib = Signal((46, True), reset_less=True)
         v4      = Signal()
-        row4    = Signal(16, reset_less=True)
+        row4    = Signal(ROW_BITS, reset_less=True)
         rlast4  = Signal(reset_less=True)
         self.sync += [
             contrib.eq((prod << 12) >> shamt),
@@ -514,11 +519,11 @@ class ChannelPipe(LiteXModule):
         self.comb += result.eq(acc_new >> self.rshift)
         self.comb += acc_new.eq(acc + contrib)
 
-        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 1)], out_fifo_depth)
+        out_fifo = stream.SyncFIFO([("row", ROW_BITS), ("data", 32), ("head", 1)], out_fifo_depth)
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
         # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
         # matvec kinds), so the source muxes by kind.
-        axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256), ("head", 1)], 4)
+        axw_fifo = stream.SyncFIFO([("row", ROW_BITS), ("data", 256), ("head", 1)], 4)
         self.submodules += out_fifo, axw_fifo
 
         self.sync += [

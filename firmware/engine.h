@@ -37,9 +37,24 @@
 /* Op */
 /*----*/
 
+// Rows per channel one op carries: the engine command's row field (16 bits before the
+// gateware exported its width). Longer tensors are split by the caller.
+#ifdef TRIXIUM_ENGINE_ROW_BITS
+#define ENGINE_ROWS_MAX ((1u << TRIXIUM_ENGINE_ROW_BITS) - 1u)
+#else
+#define ENGINE_ROWS_MAX 0xFFFFu
+#endif
+
+// Descriptor word 2: rows[15:0] | rem << 16 | rows[19:16] << 24 (the high row bits sit above
+// rem, so every descriptor written for 16-bit rows keeps its meaning).
+static inline uint32_t engine_rows_word(uint32_t rows, uint32_t rem)
+{
+    return (rows & 0xFFFFu) | (rem << 16) | ((rows >> 16) << 24);
+}
+
 struct engine_op {
     uint8_t  kind;
-    uint16_t rows;        // Rows per channel.
+    uint32_t rows;        // Rows per channel (at most ENGINE_ROWS_MAX).
     uint8_t  rem;         // Channels < rem stream one extra row (striped KV).
     uint8_t  ilv;         // Interleaved (position-major) gather.
     uint8_t  supw;        // Suppress scratchpad result writes (argmax tap only).
@@ -78,6 +93,7 @@ void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
 void engine_store(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t src);
 
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).
+void engine_hist_seq(uint32_t idx0, uint32_t count); // Stall-report history: a list launch.
 int engine_recover(void); // Soft reset of the engine cluster; 0 = recovered, <0 = reconfigure.
 extern int engine_diag;   // Opt-in per-op stall diagnostics (~2k cycles/op).
 

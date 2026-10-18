@@ -1467,34 +1467,55 @@ attn_heads_done: ;
         // (global row order, ties to smallest - same as the CPU scan). Padding rows
         // (vocab not divisible by n_ch) can win with garbage logits: fall through to
         // the chunked CPU scan in that rare case.
+        // A head with more rows per channel than the engine's row field holds (16-bit
+        // bitstreams: the 1.7B's 151669-row vocabulary on two channels, 75835 each) runs
+        // as row slices, the best (value, then smallest token: the CPU scan's tie rule)
+        // kept across them. One op past the field truncated rows but not wlen, and the
+        // readers were left holding the rest of the head.
         uint32_t rb = bons_row_beats(head->cols, head->kind, head->group);
-        struct engine_op op = {0};
-        op.kind   = ENGINE_KIND_TERNARY;
-        op.rows   = rpc;
-        op.cols   = head->cols;
-        op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
-        op.wlen   = rpc*rb;
-        op.sbeats = bons_scale_beats(head->cols, head->group);
-        op.cbeats = bons_code_beats(head->cols, head->kind);
-        op.pk     = (head->kind == KIND_TERNARY5);
-        op.bias   = head->bias;
-        op.rshift = head->rshift;
-        op.xsrc   = SP_X;
-        op.dst    = SP_Y;
-        op.supw   = 1;
-        if (likely(seq_use)) {
-            // The next forward's per-token list prep (score padding + the
-            // rowsw/wlen/blocks patches) depends only on the position, never on the
-            // token this argmax is about to pick - post it under the argmax stream.
-            // supw=1 leaves the W port idle, so the posted writes drain freely.
-            uint32_t dl = engine_submit(&op);
-            attn_list_prep_token(n_pos);
-            qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
-            engine_join(dl);
-        } else {
-            engine_run(&op);
+        uint32_t nsl = (rpc + ENGINE_ROWS_MAX - 1)/ENGINE_ROWS_MAX;
+        uint32_t srows = (rpc + nsl - 1)/nsl;
+        uint32_t idx = 0xFFFFFF;
+        int32_t  bval = 0;
+        for (uint32_t r0 = 0; r0 < rpc; r0 += srows) {
+            uint32_t rows = (r0 + srows <= rpc) ? srows : (rpc - r0);
+            struct engine_op op = {0};
+            op.kind   = ENGINE_KIND_TERNARY;
+            op.rows   = rows;
+            op.cols   = head->cols;
+            op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
+            op.wlen   = rows*rb;
+            op.sbeats = bons_scale_beats(head->cols, head->group);
+            op.cbeats = bons_code_beats(head->cols, head->kind);
+            op.pk     = (head->kind == KIND_TERNARY5);
+            op.bias   = head->bias;
+            op.rshift = head->rshift;
+            op.xsrc   = SP_X;
+            op.dst    = SP_Y;
+            op.supw   = 1;
+            if (likely(seq_use) && r0 == 0) {
+                // The next forward's per-token list prep (score padding + the
+                // rowsw/wlen/blocks patches) depends only on the position, never on the
+                // token this argmax is about to pick - post it under the argmax stream.
+                // supw=1 leaves the W port idle, so the posted writes drain freely.
+                uint32_t dl = engine_submit(&op);
+                attn_list_prep_token(n_pos);
+                qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
+                engine_join(dl);
+            } else {
+                engine_run(&op);
+            }
+            uint32_t si = trixium_engine_csr_argmax_idx_read();   // grant*rows + row
+            if (si == 0xFFFFFF)
+                continue;
+            if (nsl == 1) { idx = si; break; }
+            uint32_t tok = (si/rows)*rpc + r0 + si % rows;
+            int32_t  v   = (int32_t)trixium_engine_csr_argmax_val_read();
+            if (idx == 0xFFFFFF || v > bval || (v == bval && tok < idx)) {
+                idx = tok;
+                bval = v;
+            }
         }
-        uint32_t idx = trixium_engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
             perf_exit(OP_LMHEAD);
             if (unlikely(tprof_active))

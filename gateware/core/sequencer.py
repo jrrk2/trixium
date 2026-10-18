@@ -47,7 +47,7 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
           rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA)
           | xred<<12 (AXPY: sum the per-channel partials in hardware);
-          w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
+          w2 = rows[15:0] | rem<<16 | rows[19:16]<<24;  w3 = cols;  w4 = wbase;  w5 = wlen;
           w6 = sbeats | pk<<4 | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
           w8 = xsrc;  w9 = dst;  w10 = chan;
@@ -97,6 +97,7 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 from litex.soc.interconnect import stream
 
+from gateware.core.pipe import ROW_BITS
 from gateware.units.hadamard import HADAMARD_COMMAND
 from gateware.units.activation import ACTIVATION_COMMAND
 from gateware.units.restore import RESTORE_COMMAND
@@ -210,7 +211,7 @@ class Sequencer(LiteXModule):
         self.eng_valid   = Signal()
         self.eng_ready   = Signal()
         self.eng_kind    = Signal(3)
-        self.eng_rows    = Signal(16)
+        self.eng_rows    = Signal(ROW_BITS)
         self.eng_cols    = Signal(14)
         self.eng_wbase   = Signal(32)
         self.eng_wlen    = Signal(24)
@@ -618,7 +619,7 @@ class Sequencer(LiteXModule):
             self.eng_kind.eq(w(0, 1)[0:3]),
             self.eng_ilv.eq(w(0, 1)[8]),
             self.eng_supw.eq(w(0, 1)[9]),
-            self.eng_rows.eq(w(0, 2)[0:16]),
+            self.eng_rows.eq(Cat(w(0, 2)[0:16], w(0, 2)[24:24 + ROW_BITS - 16])),
             self.eng_rem.eq(w(0, 2)[16:21]),
             self.eng_cols.eq(w(0, 3)[0:14]),
             self.eng_wbase.eq(w(0, 4)),

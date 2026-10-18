@@ -31,7 +31,7 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 
 from gateware.memory.axi import AXIReader
-from gateware.core.pipe import ChannelPipe
+from gateware.core.pipe import ChannelPipe, ROW_BITS
 from gateware.core.trit5 import Trit5Unpacker
 from gateware.units.deltanet_stream import DeltaNetStream
 from gateware.units.attention_stream import AttentionStream
@@ -68,19 +68,19 @@ class _ResultPacker(LiteXModule):
     only in fewer, wider writes.
     """
     def __init__(self):
-        layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
+        layout = [("row", ROW_BITS), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
         self.sink   = stream.Endpoint(layout)
         self.source = stream.Endpoint(layout + [("lanes", 8)])
         self.enable    = Signal()   # Plain-matvec mode: pack. Otherwise a plain relay.
         self.clear     = Signal()   # Op start.
-        self.rows_last = Signal(16) # This pipe's last row index (static per op).
+        self.rows_last = Signal(ROW_BITS) # This pipe's last row index (static per op).
         self.qn        = Signal()   # Dual-Q: the last result is (rows_last, head 1).
 
         # # #
 
         # Held entry (the payload is reset-less: qualified by p_v).
         p_v       = Signal()
-        p_row     = Signal(16,  reset_less=True)
+        p_row     = Signal(ROW_BITS, reset_less=True)
         p_dat     = Signal(256, reset_less=True)
         p_wide    = Signal(reset_less=True)
         p_head    = Signal(reset_less=True)
@@ -222,7 +222,7 @@ class MatVecEngine(LiteXModule):
                              # 7: weight prefetch (prefetch only: the next matvec's read
                              # commands - wbase/wlen/rem/sbeats/cbeats as that op - issued now,
                              # its beats wait in the readers' FIFOs; done at once).
-            ("rows",   16),  # Rows per channel.
+            ("rows",   ROW_BITS), # Rows per channel.
             ("cols",   14),  # K.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
             ("wlen",   24),  # Per-channel weight length in beats.
@@ -577,12 +577,12 @@ class MatVecEngine(LiteXModule):
             # Registered input stage: the slot arithmetic below is computed from the pipe
             # FIFO's asynchronous read and lands in flops here, so the packer's merge
             # compare starts from registers.
-            ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
+            ib = stream.Buffer([("row", ROW_BITS), ("data", 256), ("wide", 1), ("head", 1),
                                 ("slot", 24)])
             setattr(self, f"gin{i}", ib)
             pk = _ResultPacker()
             setattr(self, f"pack{i}", pk)
-            rows_last_i = Signal(16, reset_less=True)
+            rows_last_i = Signal(ROW_BITS, reset_less=True)
             self.sync += rows_last_i.eq(cmd_r["rows"] - 1 + (i < cmd_r["rem"]))
             self.comb += [
                 ib.sink.valid.eq(pipe.source.valid),
@@ -1213,7 +1213,7 @@ class MatVecEngine(LiteXModule):
                         self.pf_mismatch.eq(1)),
                 ),
             ]
-        mv_total = Signal(24)
+        mv_total = Signal(32)
         ax_total = Signal(24)
         # Test-visible aliases (no hardware: same signals under a name a testbench can find).
         # A stall in RUN is either "results never produced" or "produced but never retired",

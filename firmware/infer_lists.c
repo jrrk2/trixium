@@ -875,7 +875,7 @@ void attn_list_prep_token(int pos)
     }
     uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
     uint32_t wlen  = rows*kv_rb;
-    uint32_t rowsw = rows | (rem << 16);
+    uint32_t rowsw = engine_rows_word(rows, rem);
     uint32_t blocks = (uint32_t)(cnt + padn)/16;
     for (int j = 0; j < seq_attn_heads; j++) {
         seq_patch(attn_di_sc(j), 2, rowsw);    // scores rows|rem.

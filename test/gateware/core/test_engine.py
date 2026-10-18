@@ -589,6 +589,55 @@ def test_engine_argmax_tap_and_suppress(backend):
     assert r.reads["region"] == bytes(8*32)
 
 @COMPILED
+def test_engine_rows_past_16_bits(backend):
+    # A suppressed-write argmax op over more than 65535 rows per channel (the 1.7B's LM head:
+    # 151669 rows on two channels), the winner planted past row 65535 of channel 0, then a
+    # FETCH. With a 16-bit row field the op ran 65600 - 65536 = 64 rows against the full wlen:
+    # the readers kept the rest and the FETCH never issued.
+    n_channels, rows_per_chan, cols, seed = 2, 65600, 128, 61
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    scales = rng.uniform(0.01, 0.02, (M, 1)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    win    = 65590                                          # Channel 0, row 65590.
+    codes[win]  = np.where(x8 > 0, 2, np.where(x8 < 0, 0, 1))
+    scales[win] = 0.06
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    assert int(np.argmax(expected)) == win
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = []
+    for c in range(n_channels):
+        row0, nrows = layout.shard_rows(M, n_channels, c)
+        payloads.append(encode_rows(spec, row0, nrows).tobytes())
+    rb = layout.row_beats(cols, layout.KIND_TERNARY)
+
+    s = Script()
+    submit(s, dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000, supw=1))
+    s.wait("done", cap=2*rows_per_chan*rb + 20000, tag="timeout")
+    s.step(2)
+    s.peek("argmax_val")
+    s.peek("argmax_idx")
+    submit(s, dict(kind=2, chan=0, wbase=0, wlen=4, dst=0x1000))
+    s.wait("done", cap=5000, tag="fetch_after_timeout")
+    s.step()
+    s.read("sp", 0x1000, 4*32, "fetched")
+    r = EngineBench(n_channels).run(backend, s, sp=x8.tobytes(), payloads=payloads,
+                                    model_size=8 << 20)
+    assert r.peek("argmax_val", signed_width=32) == int(expected[win])
+    assert r.peeks["argmax_idx"] == win, (r.peeks["argmax_idx"], win)
+    assert r.reads["fetched"] == payloads[0][:4*32]
+
+@COMPILED
 def test_engine_back_to_back_scores_axpy_ragged(backend):
     """The real per-head chain: scores -> AXPY -> scores, back to back, 8 channels, ragged.
 

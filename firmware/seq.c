@@ -62,7 +62,10 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
                      | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)
                      | ((uint32_t)op->xred << 12);
-    d[2]  = op->rows | ((uint32_t)op->rem << 16);
+    if (op->rows > ENGINE_ROWS_MAX)
+        printf("seq: %lu rows per channel exceed the engine's %lu\n",
+               (unsigned long)op->rows, (unsigned long)ENGINE_ROWS_MAX);
+    d[2]  = engine_rows_word(op->rows, op->rem);
     d[3]  = op->cols;
     d[4]  = op->wbase;
     d[5]  = op->wlen;
@@ -133,6 +136,7 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
     uint32_t last = 0xFFFFFFFF, spins = 0;
     if (n < max)
         ts[n++] = perf_now();
+    engine_hist_seq(idx0, count);
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);
@@ -164,6 +168,7 @@ void seq_list_start(uint32_t idx0, uint32_t count)
         return;
     if (tprof_active)
         tprof_event((5u << 28) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
+    engine_hist_seq(idx0, count);
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);
@@ -173,6 +178,7 @@ void seq_run(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.
         return;
+    engine_hist_seq(idx0, count);
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);

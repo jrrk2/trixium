@@ -24,6 +24,7 @@ from gateware.core.reset import EngineResetDomain
 from gateware.core.vector import VectorUnit
 from gateware.core.sequencer import Sequencer
 from gateware.core.engine import MatVecEngine
+from gateware.core.pipe import ROW_BITS
 from gateware.core.csr import EngineCSR
 from gateware.memory.loader import Loader
 from gateware.units.hadamard import HadamardScratchpad
@@ -287,6 +288,8 @@ class TriXiumCore(LiteXModule):
         self.comb += self.scratchpad.units_idle.eq(units_idle)
         for name in ("TRIXIUM_HAS_KVSTORE", "TRIXIUM_HAS_TOPK"):
             self.add_constant(name)
+        # Rows per channel the engine command carries (firmware splits longer ops).
+        self.add_constant("TRIXIUM_ENGINE_ROW_BITS", ROW_BITS)
         self.add_constant("TRIXIUM_SP_SB_SLOT",  1)
         self.add_constant("TRIXIUM_SP_SB_RSLOT", 1)
 

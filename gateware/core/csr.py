@@ -21,13 +21,15 @@ from litex.gen import *
 
 from litex.soc.interconnect.csr import *
 
+from gateware.core.pipe import ROW_BITS
+
 # Engine CSR ---------------------------------------------------------------------------------------
 
 class EngineCSR(LiteXModule):
     def __init__(self, engine, seq=None):
         # Op.
         self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
-        self.rows    = CSRStorage(16, description="Rows per channel.")
+        self.rows    = CSRStorage(ROW_BITS, description="Rows per channel.")
         self.cols    = CSRStorage(14, description="Columns (K).")
         self.wbase   = CSRStorage(32, description="Per-channel weight byte address.")
         self.wlen    = CSRStorage(24, description="Per-channel weight length in beats.")

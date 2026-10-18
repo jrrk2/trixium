@@ -1,3 +1,4 @@
+#include <string.h>
 /* SPDX-License-Identifier: BSD-2-Clause
  *
  * TriXium engine driver: program one op, submit, poll completion
@@ -108,9 +109,62 @@ static int eng_shadow_valid;
 static uint32_t eng_beats0[TRIXIUM_N_CHANNELS];
 static uint32_t eng_nslot;
 
+// Op history for the stall report: the op that wedges a reader is usually not the one that
+// stalls (a reader takes a new command only after issuing every burst of the last one).
+struct eng_hist { uint8_t kind, chan, src; uint32_t wbase, wlen, rows, rem, sb, cb, done; };
+static struct eng_hist eng_hist[16];
+static uint32_t eng_hist_n;
+
+void engine_hist_seq(uint32_t idx0, uint32_t count)
+{
+    struct eng_hist *h = &eng_hist[eng_hist_n++ & 15];
+    memset(h, 0, sizeof(*h));
+    h->src = 1; h->wbase = idx0; h->wlen = count;
+    h->done = trixium_engine_csr_done_count_read();
+}
+
+static void engine_hist_print(void)
+{
+    uint32_t n = eng_hist_n < 16 ? eng_hist_n : 16;
+    printf("ENGHIST (oldest first, %lu ops total):\n", (unsigned long)eng_hist_n);
+    for (uint32_t i = eng_hist_n - n; i != eng_hist_n; i++) {
+        const struct eng_hist *h = &eng_hist[i & 15];
+        if (h->src)
+            printf("  seq list idx %lu count %lu (done %lu)\n", (unsigned long)h->wbase,
+                   (unsigned long)h->wlen, (unsigned long)h->done);
+        else
+            printf("  kind %u ch %u wbase %08lx wlen %lu rows %lu rem %lu sb %lu cb %lu (done %lu)\n",
+                   h->kind, h->chan, (unsigned long)h->wbase, (unsigned long)h->wlen,
+                   (unsigned long)h->rows, (unsigned long)h->rem, (unsigned long)h->sb,
+                   (unsigned long)h->cb, (unsigned long)h->done);
+    }
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR
+    printf("  pf hits %lu mismatch %lu\n", (unsigned long)trixium_engine_csr_pf_hits_read(),
+           (unsigned long)trixium_engine_csr_pf_mismatch_read());
+#endif
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        trixium_engine_csr_perf_chan_write(c);
+        printf("  reader %d: beats %lu ar-stall %lu r-stall %lu\n", c,
+               (unsigned long)trixium_engine_csr_perf_beats_read(),
+               (unsigned long)trixium_engine_csr_perf_ar_read(),
+               (unsigned long)trixium_engine_csr_perf_r_read());
+    }
+}
+
 uint32_t engine_submit(const struct engine_op *op)
 {
     uint32_t done = trixium_engine_csr_done_count_read();
+    // An op longer than the row field would run a truncated row count against the full
+    // wlen, and the readers would keep the rest: say so rather than wedge silently.
+    if (op->rows > ENGINE_ROWS_MAX)
+        printf("engine: %lu rows per channel exceed the engine's %lu - split the op\n",
+               (unsigned long)op->rows, (unsigned long)ENGINE_ROWS_MAX);
+    {
+        struct eng_hist *h = &eng_hist[eng_hist_n++ & 15];
+        h->kind = op->kind; h->chan = op->chan; h->src = 0; h->wbase = op->wbase;
+        h->wlen = op->wlen; h->rows = op->rows; h->rem = op->rem; h->sb = op->sbeats;
+        h->cb = op->cbeats; h->done = done;
+    }
 
     ENG_WR(kind);
     ENG_WR(rows);
@@ -220,6 +274,8 @@ void engine_join(uint32_t done)
                 printf("%c", (rslot[i] == 0xDEADBEEFu) ? 'X' : '.');
         }
         printf("\n");
+        if (reports == 0)
+            engine_hist_print();
         // Give up rather than spin forever: a stuck op holds the scratchpad grant, so nothing
         // downstream is trustworthy, and spinning would leave a card that answers nothing.
         if (++reports == 8) {
